@@ -1,20 +1,20 @@
-// Sophicar ESP32-S3-N16R8 carrier staged bring-up for:
-//   1) External A4988 first folding joint plus HTD-ID11 second folding joint.
+// DFRobot DFR0994 Romeo ESP32-S3-N16R8 staged controller for:
+//   1) Two independent external A4988 folding joints, quarter-step.
 //   2) Six HX-30HM arm servos on the shared BusLinker UART.
-//   3) Four MG513P30 12V wheel motors through the carrier's two onboard DRV8870
-//      channels: both left motors in parallel on M1, both right motors in
-//      parallel on M2.
+//   3) Four MG513P30 12V wheel motors through the DFR0994 onboard M1..M4
+//      channels: one motor per PH/EN channel.
 //
 // Safety policy:
 //   - Nothing moves automatically after boot.
 //   - Use Serial Monitor commands to run one small test at a time.
-//   - all_stop stops local STEP pulses first, sends HTD stop, holds the HX arm,
-//     and stops both onboard chassis-driver channels.
+//   - all_stop disables BOTH local STEP/ENABLE outputs first, holds the HX arm,
+//     and stops all four onboard chassis-driver channels.
 //
 // Arduino IDE:
 //   Board: ESP32S3 Dev Module
 //   USB CDC On Boot: Enabled
-//   PSRAM: Disabled (GPIO35..38 are required by the onboard DRV8870 channels)
+//   Flash Size: 16MB
+//   PSRAM: OPI PSRAM (the DFR0994 carries ESP32-S3-WROOM-1U-N16R8)
 //   Serial Monitor: 115200
 //
 // Upper-computer protocol v0.1:
@@ -27,8 +27,8 @@
 //     {"seq":3,"cmd":"heartbeat"}
 //     {"seq":4,"cmd":"stop"}
 //     {"seq":5,"cmd":"drive","left_pwm":60,"right_pwm":60}
-//     {"seq":6,"cmd":"htd","htd_delta":10,"time_ms":800}
-//     {"seq":7,"cmd":"motion","htd_delta":10,"pwm":50}
+//   Legacy HTD commands are retired; ROS uses the existing WebSocket lease.
+//   WebSocket example: {"type":"stepper_zero","axis":2}
 
 #include <Arduino.h>
 #include <cJSON.h>
@@ -49,10 +49,7 @@
 #include <limits.h>
 #include <soc/gpio_sig_map.h>
 
-#if defined(BOARD_HAS_PSRAM)
-#error "This carrier uses GPIO35..38 for DRV8870. Select PSRAM Disabled."
-#endif
-constexpr const char *FIRMWARE_BUILD_ID = "foldbot-20260916-ros-esp32-v2";
+constexpr const char *FIRMWARE_BUILD_ID = "foldbot-20260919-dfr0994-dual-a4988-v1";
 bool motionStopPending();
 
 struct MotionProfile {
@@ -80,6 +77,8 @@ class StepperMotion {
                          uint32_t durationMs,
                          uint64_t completionLimitUs);
   bool startJog(int32_t deltaSteps);
+  void deferDiagnostics(bool deferred) { diagnosticsDeferred_ = deferred; }
+  void quiesceForGroupStop();
   void emergencyStopAndDisable();
   void disableHoldingTorque();
 
@@ -151,6 +150,7 @@ class StepperMotion {
   uint8_t stepPin_;
   int8_t enablePin_;
   bool pinsReady_ = false;
+  bool diagnosticsDeferred_ = false;
   volatile uint8_t gpioFaultMask_ = 0;
   volatile uint32_t verifiedPulses_ = 0;
   // Session latch: only reboot permits normal motion again. No NVS writes.
@@ -543,12 +543,8 @@ bool StepperMotion::startEndpointMove(int32_t targetSteps,
                                       uint64_t completionLimitUs) {
   const int32_t position = currentSteps();
   const int32_t travel = travelSteps();
-  if (targetSteps == travel && position != 0) {
-    setError("unfold_requires_folded_endpoint");
-    return false;
-  }
-  if (targetSteps == 0 && position != travel) {
-    setError("fold_requires_unfolded_endpoint");
+  if (position < 0 || position > travel || (targetSteps != 0 && targetSteps != travel)) {
+    setError("endpoint_move_outside_calibrated_range");
     return false;
   }
   return startMoveInternal(targetSteps, durationMs, completionLimitUs, true,
@@ -587,6 +583,23 @@ bool StepperMotion::startJog(int32_t deltaSteps) {
       static_cast<uint32_t>((fastestUs + 999ULL) / 1000ULL) + 100U;
   if (durationMs < 300U) durationMs = 300U;
   return startMoveInternal(target, durationMs, UINT64_MAX, false, kJogProfile);
+}
+
+void StepperMotion::quiesceForGroupStop() {
+  // No log/UART/heap work here: a group must quiesce BOTH pulse sources before
+  // entering potentially slow timer cleanup or reporting for either member.
+  portENTER_CRITICAL(&stateMux_);
+  ++moveGeneration_;
+  if (moveGeneration_ == 0) ++moveGeneration_;
+  stopRequested_ = true;
+  active_ = false;
+  levelTestActive_ = false;
+  timerRunning_ = false;
+  homed_ = false;
+  driverEnabled_ = false;
+  gpio_set_level(static_cast<gpio_num_t>(stepPin_), LOW);
+  if (hasEnableControl()) gpio_set_level(static_cast<gpio_num_t>(enablePin_), kEnableInactive);
+  portEXIT_CRITICAL(&stateMux_);
 }
 
 void StepperMotion::emergencyStopAndDisable() {
@@ -632,7 +645,7 @@ void StepperMotion::emergencyStopAndDisable() {
   } else {
     setError("stopped_by_user");
   }
-  Serial.printf("STEPPER software stop position=%ld pulses=stopped enable_control=%s\n",
+  if (!diagnosticsDeferred_) Serial.printf("STEPPER software stop position=%ld pulses=stopped enable_control=%s\n",
                 static_cast<long>(stoppedPosition),
                 hasEnableControl() ? "yes" : "no");
 }
@@ -1106,7 +1119,7 @@ bool StepperMotion::startMoveInternal(int32_t targetSteps,
   const uint32_t firstPeriodUs =
       stepPeriodUs(0, total, peakPeriodUs, profile);
   if (!startPulseTimer(firstPeriodUs)) return false;
-  Serial.printf(
+  if (!diagnosticsDeferred_) Serial.printf(
       "STEPPER GPTimer plan from=%ld target=%ld steps=%lu duration_ms=%lu "
       "estimated_us=%llu peak_period_us=%lu peak_rate=%.2f "
       "max_rate=%lu accel=%lu "
@@ -1232,7 +1245,7 @@ void StepperMotion::setDriverEnabled(bool enabled) {
 
 void StepperMotion::setError(const char *message) {
   lastError_ = message;
-  Serial.printf("STEPPER rejected/error=%s\n", message);
+  if (!diagnosticsDeferred_) Serial.printf("STEPPER rejected/error=%s\n", message);
 }
 
 void StepperMotion::clearError() {
@@ -1385,18 +1398,23 @@ void StepperMotion::printLevelTestStatus() const {
 
 
 // ---------- Pin plan ----------
-// Sophicar carrier pin plan. GPIO35..38 select the two onboard DRV8870 channels,
-// so the ESP32-S3-N16R8 must be compiled and flashed with PSRAM disabled.
-constexpr int PIN_HTD_TX = 6;   // ESP32 TX -> BusLinker RX
-constexpr int PIN_HTD_RX = 7;   // ESP32 RX <- BusLinker TX
+// DFR0994 pin plan. GPIO43/44 are the exposed UART TX/RX pair used by the
+// previously validated Romeo/BusLinker setup.
+constexpr int PIN_HTD_TX = 43;  // ESP32 TX -> BusLinker RX
+constexpr int PIN_HTD_RX = 44;  // ESP32 RX <- BusLinker TX
 
-// First folding joint: external A4988 + MINIFZ14-80. All logic wires are taken
-// directly from the ESP32 GPIO3/GPIO8/GPIO10/3V3/GND pins; STP slots stay empty.
+// First folding joint: external A4988 + MINIFZ14-80. GPIO9 from the earlier
+// standalone Romeo demo is not available for ENABLE because DFR0994 M3 uses it.
 // Quarter-step hardware: MS1=GND, MS2=3V3, MS3=GND. ENABLE is active LOW with an
 // external approximately 10 kOhm pull-up to 3.3 V.
-constexpr uint8_t PIN_FOLD_DIR = 3;
+constexpr uint8_t PIN_FOLD_DIR = 7;
 constexpr uint8_t PIN_FOLD_STEP = 8;
-constexpr int8_t PIN_FOLD_ENABLE = 10;
+constexpr int8_t PIN_FOLD_ENABLE = 6;
+// Second external A4988. GPIO4/5 share CAM, GPIO38 shares GDI:
+// do not attach those interfaces while these drivers are connected.
+constexpr uint8_t PIN_FOLD2_DIR = 4;
+constexpr uint8_t PIN_FOLD2_STEP = 5;
+constexpr int8_t PIN_FOLD2_ENABLE = 38;
 constexpr uint16_t FOLD_ACTION_DURATION_MS = 6000;
 // Reserve 200 ms for cumulative ISR/software overhead; never accelerate catch-up.
 constexpr uint16_t FOLD_STEPPER_PLAN_MS = 5800;
@@ -1410,6 +1428,7 @@ constexpr int16_t FOLD_ID11_UNFOLDED_POSITION = 719;
 // counts that would otherwise pass the new numeric range. Servo NVS is untouched.
 constexpr uint32_t FOLD_MOTION_SCHEMA_VERSION = 4;
 constexpr char FOLD_NVS_NAMESPACE[] = "fold-demo";
+constexpr char FOLD_NVS_NAMESPACE2[] = "fold2-demo";
 constexpr char FOLD_NVS_KEY_SCHEMA[] = "motion_schema";
 constexpr char FOLD_NVS_KEY_TRAVEL_VALID[] = "travel_valid";
 constexpr char FOLD_NVS_KEY_TRAVEL_STEPS[] = "travel_steps";
@@ -1427,18 +1446,46 @@ static_assert(FOLD_STEPPER_PLAN_MS < FOLD_ACTION_DURATION_MS,
 constexpr uint32_t ACTION_TIMEOUT_GRACE_MS = 1000;
 constexpr uint32_t MAX_BASE_DURATION_SEC = 2147482;
 
-// Onboard brushed-DC drive.  M1 carries both left motors in parallel and M2
-// carries both right motors in parallel.  There is no separate PWM pin: PWM is
-// applied directly to one IN pin while the other IN pin stays LOW.
-constexpr int PIN_ONBOARD_M1_IN1 = 38;
-constexpr int PIN_ONBOARD_M1_IN2 = 37;
-constexpr int PIN_ONBOARD_M2_IN1 = 36;
-constexpr int PIN_ONBOARD_M2_IN2 = 35;
-// Preserve the previously verified logical left/right direction convention.
-// If a complete side runs backwards after rewiring, change only its flag.  If
-// one motor on a parallel pair runs backwards, swap only that motor's two leads.
-constexpr bool ONBOARD_M1_INVERTED = true;
-constexpr bool ONBOARD_M2_INVERTED = false;
+// DFR0994 onboard brushed-DC drive in PH/EN mode (PMODE jumper shorted).
+// EN receives PWM; PH selects direction. One motor is connected per channel.
+constexpr int PIN_M1_EN = 12;
+constexpr int PIN_M1_PH = 13;
+constexpr int PIN_M2_EN = 14;
+constexpr int PIN_M2_PH = 21;
+constexpr int PIN_M3_EN = 9;
+constexpr int PIN_M3_PH = 10;
+constexpr int PIN_M4_EN = 47;
+constexpr int PIN_M4_PH = 11;
+
+// Initial logical direction migration. Each flag remains separately adjustable
+// after the wheels-off-ground acceptance test; no automatic motion occurs.
+constexpr bool M1_INVERTED = true;
+constexpr bool M2_INVERTED = true;
+constexpr bool M3_INVERTED = false;
+constexpr bool M4_INVERTED = false;
+
+// For unique GPIOs, the sum of their single-bit values equals their bitwise OR.
+// This avoids a helper function here: Arduino inserts generated prototypes at
+// the first free function and would otherwise place later type-dependent
+// prototypes before ServoDescriptor/ControlOwner are declared.
+constexpr uint64_t DFR0994_CONTROL_PIN_SUM =
+    (1ULL << PIN_HTD_TX) + (1ULL << PIN_HTD_RX) +
+    (1ULL << PIN_FOLD_DIR) + (1ULL << PIN_FOLD_STEP) + (1ULL << PIN_FOLD_ENABLE) +
+    (1ULL << PIN_FOLD2_DIR) + (1ULL << PIN_FOLD2_STEP) + (1ULL << PIN_FOLD2_ENABLE) +
+    (1ULL << PIN_M1_EN) + (1ULL << PIN_M1_PH) +
+    (1ULL << PIN_M2_EN) + (1ULL << PIN_M2_PH) +
+    (1ULL << PIN_M3_EN) + (1ULL << PIN_M3_PH) +
+    (1ULL << PIN_M4_EN) + (1ULL << PIN_M4_PH);
+constexpr uint64_t DFR0994_CONTROL_PIN_MASK =
+    (1ULL << PIN_HTD_TX) | (1ULL << PIN_HTD_RX) |
+    (1ULL << PIN_FOLD_DIR) | (1ULL << PIN_FOLD_STEP) | (1ULL << PIN_FOLD_ENABLE) |
+    (1ULL << PIN_FOLD2_DIR) | (1ULL << PIN_FOLD2_STEP) | (1ULL << PIN_FOLD2_ENABLE) |
+    (1ULL << PIN_M1_EN) | (1ULL << PIN_M1_PH) |
+    (1ULL << PIN_M2_EN) | (1ULL << PIN_M2_PH) |
+    (1ULL << PIN_M3_EN) | (1ULL << PIN_M3_PH) |
+    (1ULL << PIN_M4_EN) | (1ULL << PIN_M4_PH);
+static_assert(DFR0994_CONTROL_PIN_SUM == DFR0994_CONTROL_PIN_MASK,
+              "DFR0994 control GPIO assignments must be unique");
 constexpr int DRIVE_TEST_PWM = 45;   // Low first-test PWM, 0..255
 constexpr uint16_t DRIVE_TEST_MS = 500;
 constexpr int DRIVE_PROTOCOL_MAX_PWM = 120;
@@ -1474,9 +1521,8 @@ constexpr uint32_t ARM_POSITION_STALE_MS = 500;
 constexpr int32_t HX30_TEMP_MIN_POSITION = -10000;
 constexpr int32_t HX30_TEMP_MAX_POSITION = 10000;
 constexpr int16_t HX30_JOG_STEP = 8;
-// ID15 was removed: the first folding joint is now the onboard S2 stepper.  Only
-// ID11 remains in the BusLinker folding chain.
-constexpr uint8_t WEB_JOINT_POLL_IDS[] = {1, 2, 3, 4, 5, 6, 11};
+// Both folding joints are local STEP/DIR drivers; BusLinker contains HX arm only.
+constexpr uint8_t WEB_JOINT_POLL_IDS[] = {1, 2, 3, 4, 5, 6};
 constexpr bool WEB_JOINT_POLL_ENABLED = true;
 constexpr size_t WEB_MAX_FRAME_BYTES = 512;
 constexpr size_t WEB_COMMAND_QUEUE_DEPTH = 24;
@@ -1529,7 +1575,6 @@ constexpr ServoDescriptor SERVOS[] = {
     {4, ServoProtocol::Hx, "arm_joint_4_wrist_pitch", "HX-30HM"},
     {5, ServoProtocol::Hx, "arm_joint_5_wrist_roll", "HX-30HM"},
     {6, ServoProtocol::Hx, "arm_gripper", "HX-30HM"},
-    {11, ServoProtocol::Htd, "torso_second_board", "HTD-85H"},
 };
 constexpr size_t SERVO_COUNT = sizeof(SERVOS) / sizeof(SERVOS[0]);
 constexpr size_t ARM_SERVO_COUNT = 6;
@@ -1575,7 +1620,6 @@ bool allowed();
 bool startTorso();
 bool torsoDone();
 bool torsoFailed();
-bool readTorso(int32_t &position);
 bool commandAxis(uint8_t id, int32_t target, uint16_t speed, uint8_t acceleration);
 bool readAxis(uint8_t id, int32_t &position);
 
@@ -1653,11 +1697,9 @@ Result service(Runtime &r, const Profile &p, uint32_t now, const char *&error) {
     return Result::Running;
   }
   if (r.verifyTorso) {
-    int32_t position = 0;
-    const bool ok = readTorso(position);
-    if (!allowed()) return fail(r, error, "showcase_stop_or_lease");
-    if (!ok) return fail(r, error, "showcase_torso_read_failed");
-    if (position >= 714 && position <= 724 && torsoDone()) return advance(r, now);
+    // Both folding joints are now open loop. This is software pulse completion,
+    // not the retired servo's physical position feedback.
+    if (torsoDone()) return advance(r, now);
     r.verifyTorso = false;
     r.settledRounds = 0;
     return Result::Running;
@@ -1725,7 +1767,7 @@ struct PoseDefinition {
   uint8_t count;
 };
 
-// First carbon board is driven by external A4988; ID11 drives the second carbon board.
+// Retired constants remain for decoding/rejecting legacy debug commands only.
 constexpr uint8_t TORSO_SECOND_BOARD_ID = 11;
 // Kept as the legacy/default diagnostic ID for the existing serial commands.
 constexpr uint8_t TORSO_LOWER_ID = TORSO_SECOND_BOARD_ID;
@@ -1769,6 +1811,7 @@ struct WebControlCommand {
   int valueB = 0;
   int valueC = 0;
   bool enabled = false;
+  uint8_t foldAxis = 1;  // Absent JSON axis remains first-axis compatible.
   int8_t armDirections[ARM_SERVO_COUNT] = {0};
   char action[32] = {0};
 };
@@ -1788,7 +1831,9 @@ RobotActionState robotAction;
 ControlOwner robotActionOwner = ControlOwner::None;
 Preferences jointPrefs;
 Preferences foldPrefs;
+Preferences foldPrefs2;
 StepperMotion foldStepper(PIN_FOLD_DIR, PIN_FOLD_STEP, PIN_FOLD_ENABLE);
+StepperMotion foldStepper2(PIN_FOLD2_DIR, PIN_FOLD2_STEP, PIN_FOLD2_ENABLE);
 
 enum class FoldControlState : uint8_t {
   ZeroRequired,
@@ -1803,7 +1848,9 @@ enum class FoldControlState : uint8_t {
 FoldControlState foldState = FoldControlState::ZeroRequired;
 bool foldPreferencesReady = false;
 bool foldPulseEngineStarted = false;
-bool foldId11Online = false;
+bool foldPreferencesReady2 = false;
+bool foldPulseEngineStarted2 = false;
+uint8_t foldCalibrationAxis = 1;
 bool foldFormalCompletionObserved = false;
 // Informational execution state, not a persistent mode or offline fallback.
 bool foldActionStepperOnly = false;
@@ -1933,15 +1980,11 @@ bool allowed() {
 bool startTorso() { return allowed() && startTorsoLowerAction(true) && allowed(); }
 bool torsoDone() {
   return foldState == FoldControlState::Idle && foldStepper.isHomed() &&
-         foldStepper.currentSteps() == foldStepper.travelSteps();
+         foldStepper2.isHomed() && foldStepper.hasTravel() && foldStepper2.hasTravel() &&
+         foldStepper.currentSteps() == foldStepper.travelSteps() &&
+         foldStepper2.currentSteps() == foldStepper2.travelSteps();
 }
 bool torsoFailed() { return foldState == FoldControlState::Fault || foldState == FoldControlState::Stopped; }
-bool readTorso(int32_t &position) {
-  int actual = 0;
-  if (!allowed() || !htdReadPositionById(11, actual, 40, false)) return false;
-  position = actual;
-  return allowed();
-}
 bool readAxis(uint8_t id, int32_t &position) {
   const int index = servoIndex(id);
   return index >= 0 && jointCal[index].calibrated && allowed() &&
@@ -1969,15 +2012,12 @@ bool startShowcaseAction(ControlOwner owner, int seq, String &reason) {
   const char *error = "";
   if (!showcaseSetupReady(error)) { reason = error; return false; }
   if (!Showcase::allowed()) { reason = "showcase_stop_or_lease"; return false; }
-  if (!foldStepper.isHomed() || !foldStepper.hasTravel() || foldStepper.currentSteps() != 0) {
+  if (!foldStepper.isHomed() || !foldStepper.hasTravel() || foldStepper.currentSteps() != 0 ||
+      !foldStepper2.isHomed() || !foldStepper2.hasTravel() || foldStepper2.currentSteps() != 0) {
     reason = "showcase_confirm_folded_start"; return false;
   }
   if (!validateTorsoLowerAction(reason, true)) return false;
   if (!Showcase::allowed()) { reason = "showcase_stop_or_lease"; return false; }
-  int32_t torso = 0;
-  if (!Showcase::readTorso(torso) || torso < 33 || torso > 43) {
-    reason = "showcase_id11_not_folded"; return false;
-  }
   for (uint8_t id = 1; id <= 6; ++id) {
     int32_t actual = 0;
     if (!Showcase::readAxis(id, actual)) { reason = "showcase_arm_read_failed"; return false; }
@@ -2054,7 +2094,7 @@ bool motionStopPending() {
 }
 
 bool webMotionStartAllowed(uint32_t generation) {
-  return webMotionEnabled && !foldStepper.levelTestMode() && !motionStopPending() &&
+  return webMotionEnabled && !foldStepper.levelTestMode() && !foldStepper2.levelTestMode() && !motionStopPending() &&
          generation == webGetControlGeneration();
 }
 
@@ -2127,6 +2167,12 @@ uint32_t servoRegistrySignature() {
   return hash;
 }
 
+bool armCalibrationRegistryMatches(uint32_t stored) {
+  // FNV signature of the exact prior registry: unchanged HX IDs1..6 plus
+  // retired ID11 HTD torso_second_board. Do not trust arbitrary old registries.
+  return stored == servoRegistrySignature() || stored == 982224177UL;
+}
+
 void printHexByte(uint8_t value) {
   if (value < 0x10) {
     Serial.print('0');
@@ -2143,6 +2189,9 @@ uint8_t htdChecksum(uint8_t id, uint8_t length, uint8_t cmd, const uint8_t *para
 }
 
 void htdSend(uint8_t id, uint8_t cmd, const uint8_t *params, uint8_t paramLen) {
+  // The old torso servo has been physically replaced. Keep the UART for HX,
+  // but never transmit a retired HTD ID11 command through legacy helpers.
+  if (id == HTD_ID) return;
   uint8_t length = paramLen + 3;
   HtdSerial.write(0x55);
   HtdSerial.write(0x55);
@@ -3066,107 +3115,120 @@ void latchDrivePwmFault() {
   drivePwmFault = true;
   drivePwmReady = false;
   emergencyStopLatched = true;
-  const int pins[] = {PIN_ONBOARD_M1_IN1, PIN_ONBOARD_M1_IN2,
-                      PIN_ONBOARD_M2_IN1, PIN_ONBOARD_M2_IN2};
-  for (int pin : pins) {
+  const int enablePins[] = {PIN_M1_EN, PIN_M2_EN, PIN_M3_EN, PIN_M4_EN};
+  const int phasePins[] = {PIN_M1_PH, PIN_M2_PH, PIN_M3_PH, PIN_M4_PH};
+  for (int pin : enablePins) {
     ledcWrite(pin, 0);
     ledcDetach(pin);
     pinMode(pin, OUTPUT);
-    gpio_set_level(static_cast<gpio_num_t>(pin), LOW);
+    digitalWrite(pin, LOW);
+  }
+  for (int pin : phasePins) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
   }
   driveLeftPwm = driveRightPwm = 0;
   baseMotion.active = false;
   webDriveActive = false;
   webMotionEnabled = false;
-  Serial.println("DRV8870 PWM fault: outputs stopped; restart required");
+  Serial.println("DFR0994 PH/EN fault: all four EN outputs stopped; restart required");
 }
 
 void beginOnboardDrive() {
-  const int inputPins[] = {
-      PIN_ONBOARD_M1_IN1, PIN_ONBOARD_M1_IN2,
-      PIN_ONBOARD_M2_IN1, PIN_ONBOARD_M2_IN2};
-  for (size_t i = 0; i < 4; ++i) {
-    pinMode(inputPins[i], OUTPUT);
-    digitalWrite(inputPins[i], LOW);
-    if (!ledcAttach(inputPins[i], 20000, 8) || !ledcWrite(inputPins[i], 0)) {
+  const int enablePins[] = {PIN_M1_EN, PIN_M2_EN, PIN_M3_EN, PIN_M4_EN};
+  const int phasePins[] = {PIN_M1_PH, PIN_M2_PH, PIN_M3_PH, PIN_M4_PH};
+  for (int pin : phasePins) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+  }
+  for (int pin : enablePins) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+    if (!ledcAttach(pin, 20000, 8) || !ledcWrite(pin, 0)) {
       latchDrivePwmFault();
       return;
     }
   }
   drivePwmReady = true;
-  Serial.println("Onboard DRV8870 M1/M2 ready at 20 kHz drive/brake PWM; zero=coast; PSRAM must be disabled");
-  Serial.println("M1=left-front+left-rear parallel; M2=right-front+right-rear parallel");
+  Serial.println("DFR0994 Romeo ESP32-S3 M1..M4 ready: PH/EN, EN PWM=20kHz/8-bit, EN=0 brake");
+  Serial.println("M1=left-front M2=left-rear M3=right-front M4=right-rear; one motor per channel");
 }
 
-bool motorDriveInIn(int in1Pin, int in2Pin, int pwm) {
+bool motorDrivePhEn(int enPin, int phPin, int pwm) {
   if (!drivePwmReady || drivePwmFault) return false;
   pwm = constrain(pwm, -255, 255);
-  const uint32_t current1 = ledcRead(in1Pin);
-  const uint32_t current2 = ledcRead(in2Pin);
-  // DRV8870: 10=forward, 01=reverse, 11=brake/slow decay, 00=coast.
-  // Hold the direction input HIGH; PWM the other input with inverse duty.
-  // Keep zero/STOP as coast, not continuous electrical braking.
-  const int duty1 = pwm == 0 ? 0 : (pwm > 0 ? 255 : 255 + pwm);
-  const int duty2 = pwm == 0 ? 0 : (pwm < 0 ? 255 : 255 - pwm);
-  const uint32_t expected1 = duty1 == 255 ? 256U : duty1;
-  const uint32_t expected2 = duty2 == 255 ? 256U : duty2;
-  if (current1 == expected1 && current2 == expected2) return true;
+  const uint32_t targetDuty = static_cast<uint32_t>(abs(pwm));
+  const uint32_t expectedDuty = targetDuty == 255U ? 256U : targetDuty;
+  const bool targetPhase = pwm > 0;
+  const uint32_t currentDuty = ledcRead(enPin);
+  const bool currentPhase = digitalRead(phPin) == HIGH;
+  if (currentDuty == expectedDuty && (pwm == 0 || currentPhase == targetPhase)) return true;
 
-  // Before swapping which input is held HIGH, settle in 11 (brake).
-  // Do not reset both inputs to 00 on every joystick refresh.
-  const bool reversing = (pwm > 0 && current2 == 256U && current1 < 256U) ||
-                         (pwm < 0 && current1 == 256U && current2 < 256U);
-  if (reversing) {
-    if (!ledcWrite(in1Pin, 255) || !ledcWrite(in2Pin, 255)) {
+  // PH must never change while EN is driving current. Stop PWM first, allow the
+  // bridge to settle, then select direction and restore the requested duty.
+  if (currentDuty != 0 && pwm != 0 && currentPhase != targetPhase) {
+    if (!ledcWrite(enPin, 0)) {
       latchDrivePwmFault();
       return false;
     }
     esp_rom_delay_us(60);
-    if (ledcRead(in1Pin) != 256U || ledcRead(in2Pin) != 256U) {
+    if (ledcRead(enPin) != 0) {
       latchDrivePwmFault();
       return false;
     }
   }
 
-  // On start, write the intended direction input first. On stop, lower
-  // the modulated input first. LEDC pair updates are not hardware-atomic;
-  // this is not a guarantee of glitch-free pad transitions or shaft stop.
-  // There is no intentional full-duty startup boost or blocking motor jog.
-  const bool in1First = pwm > 0 || (pwm == 0 && current2 == 256U);
-  const bool firstOk = ledcWrite(in1First ? in1Pin : in2Pin, in1First ? duty1 : duty2);
-  if (!firstOk) {
+  if (pwm == 0) {
+    if (!ledcWrite(enPin, 0)) {
+      latchDrivePwmFault();
+      return false;
+    }
+    esp_rom_delay_us(60);
+    if (ledcRead(enPin) != 0) {
+      latchDrivePwmFault();
+      return false;
+    }
+    return true;
+  }
+
+  digitalWrite(phPin, targetPhase ? HIGH : LOW);
+  if ((digitalRead(phPin) == HIGH) != targetPhase) {
     latchDrivePwmFault();
     return false;
   }
-  if (!ledcWrite(in1First ? in2Pin : in1Pin, in1First ? duty2 : duty1)) {
+  if (!ledcWrite(enPin, targetDuty)) {
     latchDrivePwmFault();
     return false;
   }
-  // Arduino encodes 8-bit full scale as duty 256; updates latch next period.
   esp_rom_delay_us(60);
-  const bool ok = ledcRead(in1Pin) == expected1 && ledcRead(in2Pin) == expected2;
+  // Arduino core encodes 8-bit full scale (255) as hardware duty 256.
+  const bool ok = ledcRead(enPin) == expectedDuty;
   if (!ok) latchDrivePwmFault();
   return ok;
 }
 
 void chassisDriveLeft(int pwm) {
   pwm = constrain(pwm, -255, 255);
-  const int m1Pwm = ONBOARD_M1_INVERTED ? -pwm : pwm;
-  if (!motorDriveInIn(PIN_ONBOARD_M1_IN1, PIN_ONBOARD_M1_IN2, m1Pwm)) return;
+  const int m1Pwm = M1_INVERTED ? -pwm : pwm;
+  const int m2Pwm = M2_INVERTED ? -pwm : pwm;
+  if (!motorDrivePhEn(PIN_M1_EN, PIN_M1_PH, m1Pwm)) return;
+  if (!motorDrivePhEn(PIN_M2_EN, PIN_M2_PH, m2Pwm)) return;
   driveLeftPwm = pwm;
   if (ENABLE_DRIVE_PWM_TRACE && Serial) {
-    Serial.print("Onboard M1 left pwm=");
+    Serial.print("DFR0994 M1/M2 left pwm=");
     Serial.println(pwm);
   }
 }
 
 void chassisDriveRight(int pwm) {
   pwm = constrain(pwm, -255, 255);
-  const int m2Pwm = ONBOARD_M2_INVERTED ? -pwm : pwm;
-  if (!motorDriveInIn(PIN_ONBOARD_M2_IN1, PIN_ONBOARD_M2_IN2, m2Pwm)) return;
+  const int m3Pwm = M3_INVERTED ? -pwm : pwm;
+  const int m4Pwm = M4_INVERTED ? -pwm : pwm;
+  if (!motorDrivePhEn(PIN_M3_EN, PIN_M3_PH, m3Pwm)) return;
+  if (!motorDrivePhEn(PIN_M4_EN, PIN_M4_PH, m4Pwm)) return;
   driveRightPwm = pwm;
   if (ENABLE_DRIVE_PWM_TRACE && Serial) {
-    Serial.print("Onboard M2 right pwm=");
+    Serial.print("DFR0994 M3/M4 right pwm=");
     Serial.println(pwm);
   }
 }
@@ -3205,12 +3267,29 @@ void serviceBaseMotion() {
   }
 }
 
-void onboardDriveRawPulse(const char *name, int in1Pin, int in2Pin) {
-  // Keep the legacy command name, but use the same checked, timed drive path.
-  const bool left = in1Pin == PIN_ONBOARD_M1_IN1 && in2Pin == PIN_ONBOARD_M1_IN2;
-  const bool right = in1Pin == PIN_ONBOARD_M2_IN1 && in2Pin == PIN_ONBOARD_M2_IN2;
-  if ((!left && !right) ||
-      !startBaseMotion(left ? DRIVE_TEST_PWM : 0, right ? DRIVE_TEST_PWM : 0, 300)) {
+bool startSingleMotorTest(uint8_t channel) {
+  if (!drivePwmReady || drivePwmFault || baseMotion.active || channel < 1 || channel > 4) {
+    return false;
+  }
+  chassisStop();
+  bool ok = false;
+  if (channel == 1) ok = motorDrivePhEn(PIN_M1_EN, PIN_M1_PH, M1_INVERTED ? -DRIVE_TEST_PWM : DRIVE_TEST_PWM);
+  if (channel == 2) ok = motorDrivePhEn(PIN_M2_EN, PIN_M2_PH, M2_INVERTED ? -DRIVE_TEST_PWM : DRIVE_TEST_PWM);
+  if (channel == 3) ok = motorDrivePhEn(PIN_M3_EN, PIN_M3_PH, M3_INVERTED ? -DRIVE_TEST_PWM : DRIVE_TEST_PWM);
+  if (channel == 4) ok = motorDrivePhEn(PIN_M4_EN, PIN_M4_PH, M4_INVERTED ? -DRIVE_TEST_PWM : DRIVE_TEST_PWM);
+  if (!ok) {
+    chassisStop();
+    return false;
+  }
+  baseMotion.active = true;
+  baseMotion.leftPwm = 0;
+  baseMotion.rightPwm = 0;
+  baseMotion.deadlineMs = millis() + 300;
+  return true;
+}
+
+void onboardDriveRawPulse(const char *name, uint8_t channel) {
+  if (!startSingleMotorTest(channel)) {
     Serial.println("drive_test_rejected");
     return;
   }
@@ -3218,11 +3297,19 @@ void onboardDriveRawPulse(const char *name, int in1Pin, int in2Pin) {
 }
 
 void onboardM1RawTest() {
-  onboardDriveRawPulse("Onboard M1 / left pair", PIN_ONBOARD_M1_IN1, PIN_ONBOARD_M1_IN2);
+  onboardDriveRawPulse("DFR0994 M1 / left-front", 1);
 }
 
 void onboardM2RawTest() {
-  onboardDriveRawPulse("Onboard M2 / right pair", PIN_ONBOARD_M2_IN1, PIN_ONBOARD_M2_IN2);
+  onboardDriveRawPulse("DFR0994 M2 / left-rear", 2);
+}
+
+void onboardM3RawTest() {
+  onboardDriveRawPulse("DFR0994 M3 / right-front", 3);
+}
+
+void onboardM4RawTest() {
+  onboardDriveRawPulse("DFR0994 M4 / right-rear", 4);
 }
 
 void driveResetTicks() {
@@ -3256,12 +3343,12 @@ void chassisRunFor(int pwm, uint16_t ms) {
 }
 
 void chassisForwardTest() {
-  Serial.println("Onboard DRV8870 forward low-PWM test starts");
+  Serial.println("DFR0994 M1..M4 forward low-PWM test starts");
   startBaseMotion(DRIVE_TEST_PWM, DRIVE_TEST_PWM, DRIVE_TEST_MS);
 }
 
 void chassisBackwardTest() {
-  Serial.println("Onboard DRV8870 backward low-PWM test starts");
+  Serial.println("DFR0994 M1..M4 backward low-PWM test starts");
   startBaseMotion(-DRIVE_TEST_PWM, -DRIVE_TEST_PWM, DRIVE_TEST_MS);
 }
 
@@ -3312,7 +3399,7 @@ void loadCalibration() {
   const uint32_t registry = servoRegistrySignature();
   const bool schemaMatches =
       jointPrefs.getUInt("schema", 0) == CALIBRATION_SCHEMA_VERSION &&
-      jointPrefs.getUInt("registry", 0) == registry;
+      armCalibrationRegistryMatches(jointPrefs.getUInt("registry", 0));
   for (size_t i = 0; i < SERVO_COUNT; ++i) {
     char key[15];
     calibrationKey(key, sizeof(key), SERVOS[i].id, "min");
@@ -3324,9 +3411,8 @@ void loadCalibration() {
     calibrationKey(key, sizeof(key), SERVOS[i].id, "inv");
     jointCal[i].inverted = jointPrefs.getBool(key, false);
     calibrationKey(key, sizeof(key), SERVOS[i].id, "ok");
-    // The arm registry replaces an old virtual-joint map. Keep the already
-    // verified temporary folding calibration for IDs 11/15, but never carry an
-    // old mapping over to the six new physical arm joints.
+    // Accept only current or exact six-HX predecessor registry. Removing ID11
+    // must not invalidate unchanged arm IDs1..6; unrelated mappings stay locked.
     jointCal[i].calibrated =
         (schemaMatches || isLegacyTorsoServo(SERVOS[i].id)) && jointPrefs.getBool(key, false);
     if (jointCal[i].calibrated) {
@@ -3361,16 +3447,15 @@ bool saveCalibration(int index, String &reason) {
   const uint32_t registry = servoRegistrySignature();
   const bool metadataMatches =
       jointPrefs.getUInt("schema", 0) == CALIBRATION_SCHEMA_VERSION &&
-      jointPrefs.getUInt("registry", 0) == registry;
+      armCalibrationRegistryMatches(jointPrefs.getUInt("registry", 0));
   char minKey[15], ctrKey[15], maxKey[15], invKey[15], okKey[15];
   calibrationKey(minKey, sizeof(minKey), SERVOS[index].id, "min");
   calibrationKey(ctrKey, sizeof(ctrKey), SERVOS[index].id, "ctr");
   calibrationKey(maxKey, sizeof(maxKey), SERVOS[index].id, "max");
   calibrationKey(invKey, sizeof(invKey), SERVOS[index].id, "inv");
   calibrationKey(okKey, sizeof(okKey), SERVOS[index].id, "ok");
-  // A registry migration must not silently make the physical arm movable from
-  // the previous virtual-arm calibration. Preserve the temporary folding IDs
-  // only; every arm joint must be calibrated explicitly.
+  // Exact six-HX predecessor is compatible; any unrelated registry still
+  // requires explicit calibration and cannot silently unlock physical joints.
   bool writeOk = metadataMatches || invalidateNewArmCalibrationFlags(jointPrefs);
   if (writeOk) writeOk = jointPrefs.putBool(okKey, false) == sizeof(bool);
   if (writeOk) writeOk = jointPrefs.putUInt("schema", CALIBRATION_SCHEMA_VERSION) == sizeof(uint32_t);
@@ -3636,16 +3721,48 @@ bool foldFormalActionActive() {
 }
 
 bool foldAnyMotionActive() {
-  return foldStepper.isActive() || foldFormalActionActive() ||
+  return foldStepper.isActive() || foldStepper2.isActive() || foldFormalActionActive() ||
          foldState == FoldControlState::Calibrating;
 }
 
 void foldSetError(const String &message) {
+  // Fault reporting must never precede the dual-driver disable barrier.
+  if (foldState == FoldControlState::Fault) foldStopBoth();
   foldError = message;
   if (message.length()) Serial.printf("FOLD error=%s\n", message.c_str());
 }
 
-bool foldInvalidatePersistedTravel(String &reason) {
+bool foldAxisValid(uint8_t axis, String &reason) {
+  if (axis == 1 || axis == 2) return true;
+  reason = "fold_axis_must_be_1_or_2";
+  return false;
+}
+StepperMotion &foldAxisMotion(uint8_t axis) { return axis == 2 ? foldStepper2 : foldStepper; }
+Preferences &foldAxisPreferences(uint8_t axis) { return axis == 2 ? foldPrefs2 : foldPrefs; }
+bool &foldAxisPreferencesReady(uint8_t axis) { return axis == 2 ? foldPreferencesReady2 : foldPreferencesReady; }
+bool &foldAxisPulseReady(uint8_t axis) { return axis == 2 ? foldPulseEngineStarted2 : foldPulseEngineStarted; }
+
+void foldStopBoth() {
+  // Both local enables are disabled before any UART read, logging or cleanup.
+  foldStepper.quiesceForGroupStop();
+  foldStepper2.quiesceForGroupStop();
+  foldStepper.emergencyStopAndDisable();
+  foldStepper2.emergencyStopAndDisable();
+}
+
+const char *foldAxisStateName(uint8_t axis) {
+  StepperMotion &motor = foldAxisMotion(axis);
+  if (foldState == FoldControlState::Fault || motor.timerFaulted()) return "fault";
+  if (motor.isActive()) return foldStateName();
+  if (!motor.isHomed()) return foldState == FoldControlState::Stopped ? "stopped" : "zero_required";
+  return "idle";
+}
+
+bool foldInvalidatePersistedTravelForAxis(uint8_t axis, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
+  StepperMotion &foldStepper = foldAxisMotion(axis);
+  Preferences &foldPrefs = foldAxisPreferences(axis);
+  const bool foldPreferencesReady = foldAxisPreferencesReady(axis);
   foldStepper.clearTravelSteps();
   if (!foldPreferencesReady) {
     reason = "fold_nvs_unavailable";
@@ -3666,8 +3783,9 @@ bool foldInvalidatePersistedTravel(String &reason) {
   return true;
 }
 
-bool foldMigrateMotionSchema(String &reason) {
-  if (!foldInvalidatePersistedTravel(reason)) return false;
+bool foldMigrateMotionSchemaForAxis(uint8_t axis, String &reason) {
+  if (!foldInvalidatePersistedTravelForAxis(axis, reason)) return false;
+  Preferences &foldPrefs = foldAxisPreferences(axis);
   if (foldPrefs.putUInt(FOLD_NVS_KEY_SCHEMA, FOLD_MOTION_SCHEMA_VERSION) !=
       sizeof(uint32_t)) {
     reason = "fold_nvs_schema_write_failed";
@@ -3678,8 +3796,10 @@ bool foldMigrateMotionSchema(String &reason) {
   return true;
 }
 
-bool foldPersistTravel(int32_t steps, String &reason) {
-  if (!foldPreferencesReady) {
+bool foldPersistTravelForAxis(uint8_t axis, int32_t steps, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
+  Preferences &foldPrefs = foldAxisPreferences(axis);
+  if (!foldAxisPreferencesReady(axis)) {
     reason = "fold_nvs_unavailable";
     return false;
   }
@@ -3701,15 +3821,18 @@ bool foldPersistTravel(int32_t steps, String &reason) {
   return true;
 }
 
-void beginFoldMotion() {
-  // Drive only ESP32 GPIO3/8/10 for the quarter-step external A4988.
+void beginFoldAxis(uint8_t axis) {
+  StepperMotion &foldStepper = foldAxisMotion(axis);
+  Preferences &foldPrefs = foldAxisPreferences(axis);
+  bool &foldPreferencesReady = foldAxisPreferencesReady(axis);
+  bool &foldPulseEngineStarted = foldAxisPulseReady(axis);
   foldPulseEngineStarted = foldStepper.begin();
   if (!foldPulseEngineStarted) {
     foldState = FoldControlState::Fault;
     foldSetError("fold_pulse_engine_start_failed");
   }
 
-  foldPreferencesReady = foldPrefs.begin(FOLD_NVS_NAMESPACE, false);
+  foldPreferencesReady = foldPrefs.begin(axis == 2 ? FOLD_NVS_NAMESPACE2 : FOLD_NVS_NAMESPACE, false);
   if (!foldPreferencesReady) {
     foldStepper.restoreConfiguration(0, false, FOLD_STEPPER_PLAN_MS);
     foldState = FoldControlState::Fault;
@@ -3722,7 +3845,7 @@ void beginFoldMotion() {
   bool schemaMigrated = false;
   if (storedSchema != FOLD_MOTION_SCHEMA_VERSION) {
     String reason;
-    schemaMigrated = foldMigrateMotionSchema(reason);
+    schemaMigrated = foldMigrateMotionSchemaForAxis(axis, reason);
     if (!schemaMigrated) {
       // Never restore old microstep counts after a failed schema migration.
       // Latch the configuration unavailable across STOP/zero until reinit.
@@ -3743,18 +3866,32 @@ void beginFoldMotion() {
     foldStepper.restoreConfiguration(0, savedDirection,
                                      FOLD_STEPPER_PLAN_MS);
     String reason;
-    foldInvalidatePersistedTravel(reason);
+    foldInvalidatePersistedTravelForAxis(axis, reason);
   } else if (schemaMigrated) {
     foldSetError("fold_motion_schema_migrated_recalibrate");
   } else if (!travelValid && foldPrefs.isKey(FOLD_NVS_KEY_TRAVEL_STEPS)) {
     String reason;
-    foldInvalidatePersistedTravel(reason);
+    foldInvalidatePersistedTravelForAxis(axis, reason);
     foldSetError("fold_invalid_travel_record_recalibrate");
   }
 }
 
-bool foldConfirmZero(String &reason) {
-  if (!foldPreferencesReady) {
+bool foldInvalidatePersistedTravel(String &reason) { return foldInvalidatePersistedTravelForAxis(1, reason); }
+bool foldMigrateMotionSchema(String &reason) { return foldMigrateMotionSchemaForAxis(1, reason); }
+bool foldPersistTravel(int32_t steps, String &reason) { return foldPersistTravelForAxis(1, steps, reason); }
+
+void beginFoldMotion() {
+  beginFoldAxis(1);
+  beginFoldAxis(2);
+  if (foldState == FoldControlState::Fault) foldStopBoth();
+}
+
+bool foldConfirmZeroForAxis(uint8_t axis, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
+  StepperMotion &foldStepper = foldAxisMotion(axis);
+  if (motionSafetyLocked() || motionStopPending()) { reason = "motion_locked"; return false; }
+  if (!foldAxisPulseReady(axis) || !foldStepper.pulseEngineReady()) { reason = "fold_pulse_engine_unavailable"; return false; }
+  if (!foldAxisPreferencesReady(axis)) {
     reason = "fold_nvs_unavailable";
     return false;
   }
@@ -3776,16 +3913,18 @@ bool foldConfirmZero(String &reason) {
   return true;
 }
 
-bool foldConfirmUnfolded(String &reason) {
+bool foldConfirmUnfoldedForAxis(uint8_t axis, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
+  StepperMotion &foldStepper = foldAxisMotion(axis);
   if (motionSafetyLocked() || motionStopPending()) {
     reason = "motion_locked";
     return false;
   }
-  if (!foldPreferencesReady) {
+  if (!foldAxisPreferencesReady(axis)) {
     reason = "fold_nvs_unavailable";
     return false;
   }
-  if (!foldPulseEngineStarted || !foldStepper.pulseEngineReady() ||
+  if (!foldAxisPulseReady(axis) || !foldStepper.pulseEngineReady() ||
       foldState == FoldControlState::Fault) {
     reason = "fold_configuration_not_ready";
     return false;
@@ -3805,7 +3944,11 @@ bool foldConfirmUnfolded(String &reason) {
   return true;
 }
 
-bool foldJog(int32_t steps, String &reason) {
+bool foldJogForAxis(uint8_t axis, int32_t steps, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
+  StepperMotion &foldStepper = foldAxisMotion(axis);
+  if (motionSafetyLocked() || motionStopPending()) { reason = "motion_locked"; return false; }
+  if (!foldAxisPreferencesReady(axis)) { reason = "fold_nvs_unavailable"; return false; }
   if (foldAnyMotionActive() || robotAction.active || baseMotion.active || webDriveActive || isWebJogActive()) {
     reason = "busy";
     return false;
@@ -3819,12 +3962,15 @@ bool foldJog(int32_t steps, String &reason) {
     return false;
   }
   foldState = FoldControlState::Calibrating;
+  foldCalibrationAxis = axis;
   foldError = "";
   reason = "jog_started";
   return true;
 }
 
-bool foldSaveTravel(String &reason) {
+bool foldSaveTravelForAxis(uint8_t axis, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
+  StepperMotion &foldStepper = foldAxisMotion(axis);
   if (foldAnyMotionActive() || robotAction.active || baseMotion.active || webDriveActive || isWebJogActive()) {
     reason = "busy";
     return false;
@@ -3838,7 +3984,10 @@ bool foldSaveTravel(String &reason) {
     reason = foldStepper.lastError();
     return false;
   }
-  if (!foldPersistTravel(foldStepper.travelSteps(), reason)) return false;
+  if (!foldPersistTravelForAxis(axis, foldStepper.travelSteps(), reason)) {
+    foldStopBoth();
+    return false;
+  }
   foldError = "";
   reason = "travel_saved";
   return true;
@@ -3906,7 +4055,8 @@ bool restoreVerifiedStepperConfiguration(String &reason) {
   return true;
 }
 
-bool foldResetTravel(String &reason) {
+bool foldResetTravelForAxis(uint8_t axis, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
   if (foldAnyMotionActive() || robotAction.active || baseMotion.active || webDriveActive || isWebJogActive()) {
     reason = "busy";
     return false;
@@ -3915,13 +4065,16 @@ bool foldResetTravel(String &reason) {
     reason = "fold_fault";
     return false;
   }
-  if (!foldInvalidatePersistedTravel(reason)) return false;
+  if (!foldInvalidatePersistedTravelForAxis(axis, reason)) return false;
   foldError = "";
   reason = "travel_reset";
   return true;
 }
 
-bool foldToggleDirection(String &reason) {
+bool foldToggleDirectionForAxis(uint8_t axis, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
+  StepperMotion &foldStepper = foldAxisMotion(axis);
+  Preferences &foldPrefs = foldAxisPreferences(axis);
   if (foldAnyMotionActive() || robotAction.active || baseMotion.active || webDriveActive || isWebJogActive()) {
     reason = "busy";
     return false;
@@ -3935,7 +4088,7 @@ bool foldToggleDirection(String &reason) {
     return false;
   }
   const bool next = !foldStepper.directionInverted();
-  if (!foldInvalidatePersistedTravel(reason)) return false;
+  if (!foldInvalidatePersistedTravelForAxis(axis, reason)) return false;
   if (foldPrefs.putBool(FOLD_NVS_KEY_DIRECTION, next) != sizeof(uint8_t) ||
       !foldStepper.setDirectionInverted(next)) {
     reason = "fold_direction_write_failed";
@@ -3948,37 +4101,56 @@ bool foldToggleDirection(String &reason) {
   return true;
 }
 
+// Legacy serial/API entry points remain explicitly axis 1, never a mutable
+// selection that could silently move/confirm the other board.
+bool foldConfirmZero(String &reason) { return foldConfirmZeroForAxis(1, reason); }
+bool foldConfirmUnfolded(String &reason) { return foldConfirmUnfoldedForAxis(1, reason); }
+bool foldJog(int32_t steps, String &reason) { return foldJogForAxis(1, steps, reason); }
+bool foldSaveTravel(String &reason) { return foldSaveTravelForAxis(1, reason); }
+bool foldResetTravel(String &reason) { return foldResetTravelForAxis(1, reason); }
+bool foldToggleDirection(String &reason) { return foldToggleDirectionForAxis(1, reason); }
+
 bool foldRescan(String &reason) {
   if (localMotionActive() || isWebJogActive()) {
     reason = "busy";
     return false;
   }
-  foldId11Online = servoPing(TORSO_SECOND_BOARD_ID);
-  reason = foldId11Online ? "id11_online" : "id11_offline";
-  return foldId11Online;
+  foldStepper.printDiagnostics();
+  foldStepper2.printDiagnostics();
+  const bool ready = foldStepper.pulseEngineReady() && foldStepper2.pulseEngineReady();
+  reason = ready ? "dual_pulse_engines_ready_no_motor_feedback" : "fold_pulse_engine_fault";
+  return ready;
 }
 
 void serviceFoldMotion() {
-  foldStepper.service();
   const uint32_t now = millis();
-  if (foldStepper.timerFaulted() && foldState != FoldControlState::Fault) {
+  if ((foldStepper.timerFaulted() || foldStepper2.timerFaulted()) && foldState != FoldControlState::Fault) {
     allStop();
     foldState = FoldControlState::Fault;
     foldSetError("fold_pulse_timer_runtime_failed_restart_then_reconfirm_zero");
     return;
   }
-  if (foldState == FoldControlState::Calibrating && !foldStepper.isActive()) {
+  if (foldState == FoldControlState::Calibrating && !foldStepper.isActive() && !foldStepper2.isActive()) {
     foldState = FoldControlState::Idle;
   }
-  if (!foldFormalActionActive()) return;
+  if (!foldFormalActionActive()) {
+    foldStepper.service();
+    foldStepper2.service();
+    return;
+  }
 
-  if (foldStepper.completedNormally() && !foldStepper.completedWithinLimit()) {
+  if ((foldStepper.completedNormally() && !foldStepper.completedWithinLimit()) ||
+      (!foldActionStepperOnly && foldStepper2.completedNormally() && !foldStepper2.completedWithinLimit())) {
     allStop();
     foldState = FoldControlState::Fault;
     foldSetError("fold_action_timeout_reconfirm_zero");
     return;
   }
-  if (foldStepper.completedNormally() && foldStepper.completedWithinLimit()) {
+  const bool firstDone = foldStepper.isHomed() && !foldStepper.isActive() &&
+      foldStepper.currentSteps() == foldStepper.targetSteps();
+  const bool secondDone = foldStepper2.isHomed() && !foldStepper2.isActive() &&
+      foldStepper2.currentSteps() == foldStepper2.targetSteps();
+  if (firstDone && (foldActionStepperOnly || secondDone)) {
     foldFormalCompletionObserved = true;
   }
   if (static_cast<int32_t>(now - foldActionDeadlineMs) >= 0 &&
@@ -3988,6 +4160,8 @@ void serviceFoldMotion() {
     foldSetError("fold_action_timeout_reconfirm_zero");
     return;
   }
+  foldStepper.service();
+  foldStepper2.service();
   if (static_cast<int32_t>(now - foldActionFinishMs) >= 0 &&
       foldFormalCompletionObserved) {
     foldState = FoldControlState::Idle;
@@ -3997,9 +4171,11 @@ void serviceFoldMotion() {
   }
 }
 
-bool validateFoldStepperAction(String &reason) {
-  if (!foldPulseEngineStarted || !foldStepper.pulseEngineReady() ||
-      !foldPreferencesReady || foldState == FoldControlState::Fault) {
+bool validateFoldAxisAction(uint8_t axis, String &reason) {
+  if (!foldAxisValid(axis, reason)) return false;
+  StepperMotion &foldStepper = foldAxisMotion(axis);
+  if (!foldAxisPulseReady(axis) || !foldStepper.pulseEngineReady() ||
+      !foldAxisPreferencesReady(axis) || foldState == FoldControlState::Fault) {
     reason = "fold_configuration_not_ready";
     return false;
   }
@@ -4014,46 +4190,81 @@ bool validateFoldStepperAction(String &reason) {
   return true;
 }
 
+bool validateFoldStepperAction(String &reason) { return validateFoldAxisAction(1, reason); }
+
 bool validateTorsoLowerAction(String &reason, bool unfolding) {
-  if (!validateFoldStepperAction(reason)) return false;
-  const int index = servoIndex(TORSO_SECOND_BOARD_ID);
-  if (index < 0 || !jointCal[index].calibrated) {
-    reason = "id11_not_calibrated";
-    return false;
+  (void)unfolding;
+  if (motionSafetyLocked() || motionStopPending()) { reason = "motion_locked"; return false; }
+  if (!validateFoldAxisAction(1, reason)) { reason = "axis1_" + reason; return false; }
+  if (!validateFoldAxisAction(2, reason)) { reason = "axis2_" + reason; return false; }
+  // A referenced intermediate position is allowed; unknown position is never
+  // inferred. Both axes must pass their range check before either starts.
+  for (uint8_t axis = 1; axis <= 2; ++axis) {
+    StepperMotion &motor = foldAxisMotion(axis);
+    if (motor.isActive() || motor.currentSteps() < 0 || motor.currentSteps() > motor.travelSteps()) {
+      reason = axis == 1 ? "axis1_position_outside_range_or_busy" : "axis2_position_outside_range_or_busy";
+      return false;
+    }
   }
-  if (FOLD_ID11_FOLDED_POSITION < jointCal[index].minimum ||
-      FOLD_ID11_UNFOLDED_POSITION > jointCal[index].maximum) {
-    reason = "id11_target_out_of_range";
-    return false;
-  }
-  foldId11Online = servoPing(TORSO_SECOND_BOARD_ID);
-  if (!foldId11Online) {
-    reason = "id11_offline";
-    return false;
-  }
-  return id11ValidateHardwareForMotion(reason, unfolding);
+  return true;
 }
 
 bool startTorsoLowerAction(bool unfolding) {
+  String reason;
+  if (!validateTorsoLowerAction(reason, unfolding)) { foldSetError(reason); return false; }
   const int32_t stepperTarget = unfolding ? foldStepper.travelSteps() : 0;
-  const int32_t id11Target = unfolding ? FOLD_ID11_UNFOLDED_POSITION
-                                       : FOLD_ID11_FOLDED_POSITION;
-  if (!foldStepper.startEndpointMove(stepperTarget, FOLD_STEPPER_PLAN_MS,
+  const int32_t secondTarget = unfolding ? foldStepper2.travelSteps() : 0;
+  const bool firstAlreadyThere = foldStepper.currentSteps() == stepperTarget;
+  const bool secondAlreadyThere = foldStepper2.currentSteps() == secondTarget;
+  if (firstAlreadyThere && secondAlreadyThere) {
+    foldActionStepperOnly = false;
+    foldFormalCompletionObserved = true;
+    foldActionFinishMs = millis();
+    foldActionDeadlineMs = foldActionFinishMs;
+    foldState = FoldControlState::Idle;
+    foldError = "";
+    Serial.println("TORSO both_axes_already_at_requested_endpoint no_motion=yes");
+    return true;
+  }
+  // Startup is one logging transaction: a failure inside axis 2's timer/GPIO
+  // setup must not print while axis 1 still moves. Every exit restores logging.
+  struct DeferredDiagnostics {
+    StepperMotion &first;
+    StepperMotion &second;
+    DeferredDiagnostics(StepperMotion &a, StepperMotion &b) : first(a), second(b) {
+      first.deferDiagnostics(true);
+      second.deferDiagnostics(true);
+    }
+    ~DeferredDiagnostics() {
+      first.deferDiagnostics(false);
+      second.deferDiagnostics(false);
+    }
+  } defer(foldStepper, foldStepper2);
+  if (!firstAlreadyThere && !foldStepper.startEndpointMove(stepperTarget, FOLD_STEPPER_PLAN_MS,
                                      FOLD_COMPLETION_LIMIT_US)) {
-    foldSetError(foldStepper.lastError());
+    const String startError = foldStepper.lastError();
+    foldStopBoth();
+    foldState = FoldControlState::Stopped;
+    foldSetError(startError);
     return false;
   }
   if (motionStopPending()) {
-    foldStepper.emergencyStopAndDisable();
+    foldStopBoth();
     foldState = FoldControlState::Stopped;
     foldSetError("stop_requested_reconfirm_zero");
     return false;
   }
-  if (!servoMoveToFast(TORSO_SECOND_BOARD_ID, id11Target,
-                       FOLD_ACTION_DURATION_MS)) {
-    foldStepper.emergencyStopAndDisable();
+  if (!secondAlreadyThere && !foldStepper2.startEndpointMove(secondTarget, FOLD_STEPPER_PLAN_MS,
+                                                              FOLD_COMPLETION_LIMIT_US)) {
+    foldStopBoth();
     foldState = FoldControlState::Stopped;
-    foldSetError("id11_start_failed_reconfirm_zero");
+    foldSetError("axis2_start_failed_reconfirm_both_endpoints");
+    return false;
+  }
+  if (motionStopPending()) {
+    foldStopBoth();
+    foldState = FoldControlState::Stopped;
+    foldSetError("stop_requested_reconfirm_both_endpoints");
     return false;
   }
   foldActionStepperOnly = false;
@@ -4063,9 +4274,9 @@ bool startTorsoLowerAction(bool unfolding) {
   foldState = unfolding ? FoldControlState::Unfolding
                         : FoldControlState::Folding;
   foldError = "";
-  Serial.printf("TORSO %s A4988_EXTERNAL->%ld ID11->%ld duration_ms=%u\n",
+  Serial.printf("TORSO %s A4988_AXIS1->%ld A4988_AXIS2->%ld duration_ms=%u software_synchronized=yes motor_feedback=no\n",
                 unfolding ? "unfold" : "fold", static_cast<long>(stepperTarget),
-                static_cast<long>(id11Target),
+                static_cast<long>(secondTarget),
                 static_cast<unsigned>(FOLD_ACTION_DURATION_MS));
   return true;
 }
@@ -4094,7 +4305,7 @@ bool startStepperOnlyTest(bool unfolding, uint32_t durationMs, String &reason) {
     return false;
   }
   if (motionStopPending()) {
-    foldStepper.emergencyStopAndDisable();
+    foldStopBoth();
     foldState = FoldControlState::Stopped;
     reason = "stop_requested_reconfirm_zero";
     foldSetError(reason);
@@ -4107,7 +4318,7 @@ bool startStepperOnlyTest(bool unfolding, uint32_t durationMs, String &reason) {
   foldState = unfolding ? FoldControlState::Unfolding : FoldControlState::Folding;
   foldError = "";
   reason = "stepper_only_started";
-  Serial.printf("STEPPER_ONLY %s target=%ld action_ms=%lu plan_ms=%lu hard_limit_us=%llu ID11_not_commanded=yes\n",
+  Serial.printf("STEPPER_ONLY axis=1 %s target=%ld action_ms=%lu plan_ms=%lu hard_limit_us=%llu axis2_not_commanded=yes\n",
                 unfolding ? "unfold" : "fold", static_cast<long>(target),
                 static_cast<unsigned long>(durationMs), static_cast<unsigned long>(planMs),
                 limitUs);
@@ -4117,7 +4328,7 @@ bool startStepperOnlyTest(bool unfolding, uint32_t durationMs, String &reason) {
 bool handleStepperOnlyTestCommand(const String &command) {
   if (!command.startsWith("stepper_test")) return false;
   if (command == "stepper_test") {
-    Serial.println("stepper_test unfold|fold 6|10|20|30 : calibrated A4988 only; keep ID11 power disconnected for isolated testing");
+    Serial.println("stepper_test unfold|fold 6|10|20|30 : calibrated axis1 A4988 only; axis2 is NOT commanded");
     return true;
   }
   // Exact whitelist: no toInt coercion, suffixes, extra tokens or implicit motion.
@@ -4249,7 +4460,7 @@ bool startNamedAction(const String &name, int seq, ControlOwner owner, String &r
   if (baseMotion.active) {
     robotAction.deadlineMs = baseMotion.deadlineMs;
   } else if (kind == RobotActionKind::TorsoUnfold || kind == RobotActionKind::TorsoFold) {
-    robotAction.deadlineMs = millis() + FOLD_ACTION_DURATION_MS;
+    robotAction.deadlineMs = foldActionFinishMs;
   } else {
     robotAction.deadlineMs = 0;
   }
@@ -4319,7 +4530,7 @@ void printCalibrationList() {
 }
 
 bool motionSafetyLocked() {
-  return emergencyStopLatched || drivePwmFault || foldStepper.levelTestMode();
+  return emergencyStopLatched || drivePwmFault || foldStepper.levelTestMode() || foldStepper2.levelTestMode();
 }
 
 bool localMotionActive() {
@@ -4352,6 +4563,7 @@ ControlOwner activeControlOwner() {
 
 bool localTextCommandAllowedDuringMotion(const String &command) {
   return command == "fold_status" ||
+         command == "axis1 fold_status" || command == "axis2 fold_status" ||
          command == "step_diag" || command == "d_status" ||
          command == "all_stop" || command == "stop" || command == "d_stop" ||
          command == "h_stop" ||
@@ -4371,12 +4583,15 @@ void allStop() {
   webInvalidateControlCommands();
   const bool preserveSafetyState = motionSafetyLocked();
   const bool webWasInControl = webOwnsMotion || robotActionOwner == ControlOwner::Web;
-  // Stop chassis before STEP diagnostics or UART traffic can delay it.
+  // Quiesce both STEP sources without logging, then brake chassis before any
+  // timer cleanup/STEP diagnostics/UART holding traffic can delay it.
+  foldStepper.quiesceForGroupStop();
+  foldStepper2.quiesceForGroupStop();
   chassisStop();
-  foldStepper.emergencyStopAndDisable();
+  foldStopBoth();
   foldState = FoldControlState::Stopped;
   foldFormalCompletionObserved = false;
-  foldSetError("stopped_reconfirm_folded_zero");
+  foldSetError("stopped_reconfirm_both_endpoints");
   Serial.println("ALL STOP");
   robotAction = RobotActionState();
   robotActionOwner = ControlOwner::None;
@@ -4490,6 +4705,7 @@ bool jsonCommandAllowedDuringEstop(const String &command) {
 bool textCommandAllowedDuringEstop(const String &command) {
   return command == "help" || command == "all_stop" ||
          command == "stop" || command == "fold_status" ||
+         command == "axis1 fold_status" || command == "axis2 fold_status" ||
          command == "step_diag" || command == "d_status" ||
          command == "h_ping" || command == "h_pos" || command == "h_stop" ||
          command == "d_ticks" || command == "d_zero" || command == "d_stop" ||
@@ -4570,35 +4786,9 @@ bool protocolApplyDrive(const String &json) {
 }
 
 bool protocolApplyHtd(const String &json) {
-  int target = 0;
-  int delta = 0;
-  int timeMs = HTD_MOVE_TIME_MS;
-  jsonGetInt(json, "time_ms", timeMs);
-  timeMs = constrain(timeMs, 100, 2000);
-
-  bool hasTarget = jsonGetInt(json, "htd_pos", target) || jsonGetInt(json, "pos", target);
-  bool hasDelta = jsonGetInt(json, "htd_delta", delta) || jsonGetInt(json, "delta", delta);
-  if (!hasTarget && !hasDelta) {
-    return false;
-  }
-
-  int current = 0;
-  if (!htdReadPosition(current)) {
-    return false;
-  }
-
-  if (hasDelta) {
-    delta = constrain(delta, -HTD_SMALL_DELTA_UNITS, HTD_SMALL_DELTA_UNITS);
-    target = current + delta;
-  } else {
-    int minTarget = current - HTD_SMALL_DELTA_UNITS;
-    int maxTarget = current + HTD_SMALL_DELTA_UNITS;
-    target = constrain(target, minTarget, maxTarget);
-  }
-
-  target = constrain(target, 0, 1000);
-  htdMoveTo(static_cast<uint16_t>(target), static_cast<uint16_t>(timeMs));
-  return true;
+  (void)json;
+  Serial.println("ERR id11_replaced_by_stepper_axis2");
+  return false;
 }
 
 void handleJsonCommand(String json) {
@@ -4769,6 +4959,7 @@ void webSendStatus(int fd) {
   cJSON_AddStringToObject(root, "protocol", "suzhou-foldbot-web-v1");
   cJSON_AddNumberToObject(root, "rosControlVersion", 1);
   cJSON_AddStringToObject(root, "firmwareBuild", FIRMWARE_BUILD_ID);
+  cJSON_AddNumberToObject(root, "foldAxisCount", 2);
   cJSON_AddNumberToObject(root, "controlSession", webControlSession);
   cJSON_AddNumberToObject(root, "statusSeq", ++webStatusSequence);
   cJSON_AddNumberToObject(root, "uptimeMs", now);
@@ -4801,9 +4992,12 @@ void webSendStatus(int fd) {
   cJSON_AddStringToObject(root, "ip", WEB_AP_IP.toString().c_str());
   cJSON_AddNumberToObject(root, "stations", WiFi.softAPgetStationNum());
 
-  cJSON *stepper = cJSON_AddObjectToObject(root, "stepper");
+  for (uint8_t axis = 1; axis <= 2; ++axis) {
+  StepperMotion &foldStepper = foldAxisMotion(axis);
+  cJSON *stepper = cJSON_AddObjectToObject(root, axis == 1 ? "stepper" : "stepper2");
   if (stepper) {
-    cJSON_AddStringToObject(stepper, "state", foldStateName());
+    cJSON_AddStringToObject(stepper, "state", foldAxisStateName(axis));
+    cJSON_AddNumberToObject(stepper, "axis", axis);
     cJSON_AddNumberToObject(stepper, "microsteps", 4);
     cJSON_AddNumberToObject(stepper, "maxCalibrationSteps", 16000);
     cJSON_AddStringToObject(stepper, "lastExecutionMode",
@@ -4818,10 +5012,11 @@ void webSendStatus(int fd) {
     cJSON_AddBoolToObject(stepper, "enableControl", foldStepper.hasEnableControl());
     cJSON_AddBoolToObject(stepper, "directionInverted", foldStepper.directionInverted());
     cJSON_AddBoolToObject(stepper, "pulseEngineReady", foldStepper.pulseEngineReady());
-    cJSON_AddBoolToObject(stepper, "nvsReady", foldPreferencesReady);
-    cJSON_AddBoolToObject(stepper, "id11Online", foldId11Online);
+    cJSON_AddBoolToObject(stepper, "nvsReady", foldAxisPreferencesReady(axis));
+    cJSON_AddBoolToObject(stepper, "positionFeedback", false);
     cJSON_AddStringToObject(stepper, "error",
                             foldError.length() ? foldError.c_str() : foldStepper.lastError());
+  }
   }
 
   bool armDegraded = false;
@@ -5220,6 +5415,13 @@ esp_err_t webSocketHandler(httpd_req_t *req) {
     command.type = WebCommandType::Stop;
   } else {
     valid = false;
+  }
+  if (type.startsWith("stepper_")) {
+    const cJSON *axis = cJSON_GetObjectItemCaseSensitive(root, "axis");
+    int parsedAxis = 1;
+    if (axis) valid = valid && webReadInteger(root, "axis", parsedAxis) &&
+                      (parsedAxis == 1 || parsedAxis == 2);
+    if (valid) command.foldAxis = static_cast<uint8_t>(parsedAxis);
   }
   cJSON_Delete(root);
 
@@ -5721,7 +5923,7 @@ void webProcessCommand(const WebControlCommand &command) {
       bool ok = false;
       if (motionSafetyLocked()) reason = "motion_locked";
       else if (!webMotionEnabled) reason = "motion_disabled";
-      else ok = foldConfirmZero(reason);
+      else ok = foldConfirmZeroForAxis(command.foldAxis, reason);
       webSendAck(command.clientFd, "stepper_zero", ok, reason.c_str());
       break;
     }
@@ -5731,7 +5933,7 @@ void webProcessCommand(const WebControlCommand &command) {
       if (!command.enabled) reason = "endpoint_confirmation_required";
       else if (motionSafetyLocked()) reason = "motion_locked";
       else if (!webMotionEnabled) reason = "motion_disabled";
-      else ok = foldConfirmUnfolded(reason);
+      else ok = foldConfirmUnfoldedForAxis(command.foldAxis, reason);
       webSendAck(command.clientFd, "stepper_confirm_unfolded", ok, reason.c_str());
       break;
     }
@@ -5740,7 +5942,7 @@ void webProcessCommand(const WebControlCommand &command) {
       bool ok = false;
       if (motionSafetyLocked()) reason = "motion_locked";
       else if (!webMotionEnabled) reason = "motion_disabled";
-      else ok = foldJog(command.valueA, reason);
+      else ok = foldJogForAxis(command.foldAxis, command.valueA, reason);
       if (ok) {
         webMarkMotionActive();
         webNoteLeaseReceipt(command.clientFd, command.controlGeneration, command.receivedAtMs);
@@ -5750,19 +5952,19 @@ void webProcessCommand(const WebControlCommand &command) {
     }
     case WebCommandType::FoldSave: {
       String reason;
-      const bool ok = foldSaveTravel(reason);
+      const bool ok = foldSaveTravelForAxis(command.foldAxis, reason);
       webSendAck(command.clientFd, "stepper_save", ok, reason.c_str());
       break;
     }
     case WebCommandType::FoldReset: {
       String reason;
-      const bool ok = foldResetTravel(reason);
+      const bool ok = foldResetTravelForAxis(command.foldAxis, reason);
       webSendAck(command.clientFd, "stepper_reset", ok, reason.c_str());
       break;
     }
     case WebCommandType::FoldToggleDirection: {
       String reason;
-      const bool ok = foldToggleDirection(reason);
+      const bool ok = foldToggleDirectionForAxis(command.foldAxis, reason);
       webSendAck(command.clientFd, "stepper_direction", ok, reason.c_str());
       break;
     }
@@ -6011,11 +6213,13 @@ bool selectedServoPosition(int32_t &position) {
 void printFoldStatus() {
   Serial.printf("FOLD_CONFIG microsteps=4 max_calibration_steps=16000 formal_ms=6000 stepper_plan_ms=5800 last_mode=%s\n",
                 foldActionStepperOnly ? "stepper_only" : "synchronized");
+  for (uint8_t axis = 1; axis <= 2; ++axis) {
+  StepperMotion &foldStepper = foldAxisMotion(axis);
   Serial.printf(
-      "FOLD state=%s position=%ld target=%ld travel=%ld travel_valid=%s "
+      "FOLD axis=%u state=%s position=%ld target=%ld travel=%ld travel_valid=%s "
       "homed=%s active=%s pulse_command_enabled=%s enable_control=%s direction_inverted=%s "
-      "pulse_engine=%s nvs=%s id11=%s error=%s\n",
-      foldStateName(), static_cast<long>(foldStepper.currentSteps()),
+      "pulse_engine=%s nvs=%s motor_feedback=no error=%s\n",
+      axis, foldAxisStateName(axis), static_cast<long>(foldStepper.currentSteps()),
       static_cast<long>(foldStepper.targetSteps()),
       static_cast<long>(foldStepper.travelSteps()),
       foldStepper.hasTravel() ? "yes" : "no",
@@ -6025,9 +6229,37 @@ void printFoldStatus() {
       foldStepper.hasEnableControl() ? "yes" : "no",
       foldStepper.directionInverted() ? "yes" : "no",
       foldStepper.pulseEngineReady() ? "ready" : "fault",
-      foldPreferencesReady ? "ready" : "fault",
-      foldId11Online ? "online" : "unknown/offline",
+      foldAxisPreferencesReady(axis) ? "ready" : "fault",
       foldError.length() ? foldError.c_str() : foldStepper.lastError());
+  }
+}
+
+bool handleFoldAxisCommand(const String &command) {
+  if (!command.startsWith("axis1 ") && !command.startsWith("axis2 ")) return false;
+  const uint8_t axis = command.startsWith("axis2 ") ? 2 : 1;
+  const String operation = command.substring(6);
+  String reason = "unknown_axis_command";
+  bool ok = false;
+  if (operation == "fold_status") { printFoldStatus(); return true; }
+  if (webMotionEnabled || webOwnsMotion) {
+    Serial.println("ERR axis_usb_setup_requires_web_motion_disabled");
+    return true;
+  }
+  if (operation == "zero") ok = foldConfirmZeroForAxis(axis, reason);
+  else if (operation == "confirm_unfolded") ok = foldConfirmUnfoldedForAxis(axis, reason);
+  else if (operation == "save") ok = foldSaveTravelForAxis(axis, reason);
+  else if (operation == "reset_travel") ok = foldResetTravelForAxis(axis, reason);
+  else if (operation == "fold_direction") ok = foldToggleDirectionForAxis(axis, reason);
+  else if (operation.startsWith("jog ")) {
+    const String argument = operation.substring(4);
+    char *end = nullptr;
+    const long steps = strtol(argument.c_str(), &end, 10);
+    if (!argument.length() || !end || end == argument.c_str() || *end || steps < -2000 || steps > 2000 || steps == 0)
+      reason = "invalid_jog_delta";
+    else ok = foldJogForAxis(axis, static_cast<int32_t>(steps), reason);
+  }
+  Serial.printf("%s axis=%u %s\n", ok ? "OK" : "ERR", axis, reason.c_str());
+  return true;
 }
 
 void printSelectedCalibration() {
@@ -6127,27 +6359,17 @@ void printHelp() {
   Serial.println("Commands:");
   Serial.println("  help        - print commands");
   Serial.println("  all_stop    - folding + arm + onboard chassis stop");
-  Serial.println("  h_ping      - HTD read ID response");
-  Serial.println("  h_pos       - HTD read position");
-  Serial.println("  h_diag [ID] - read-only HTD position/limits/torque diagnostic (default ID 11)");
-  Serial.println("  h_prepare_calibration ID - set registered HTD ID to limits 0..1000 and torque on");
-  Serial.println("  h_apply_calibration_limits ID - persist saved calibration limits and torque on");
-  Serial.println("  h_apply_id11_limits - legacy alias for h_apply_calibration_limits 11");
-  Serial.println("  h_id11_setup_check - read-only ID11 position/limits/mode/torque; web motion must be disabled");
-  Serial.println("  h_id11_limits_write - ID11 saved limits ONLY, requires unloaded stable servo; never torque on");
-  Serial.println("  WARNING: legacy h_apply* and h_prepare_calibration still TORQUE ON; do not use for no-motion setup");
-  Serial.println("  h_baud_115k - set HTD UART to 115200");
-  Serial.println("  h_baud_1m   - unavailable; HTD bus is fixed at 115200");
-  Serial.println("  h_test      - HTD small position test, then stop");
-  Serial.println("  h_stop      - HTD stop");
-  Serial.println("  d_fwd       - onboard M1/M2 low-PWM forward 0.5s");
-  Serial.println("  d_back      - onboard M1/M2 low-PWM backward 0.5s");
+  Serial.println("  ID11 HTD retired: h_* and restore_torso_calibration are rejected; use axis2 commands");
+  Serial.println("  d_fwd       - DFR0994 M1..M4 low-PWM forward 0.5s");
+  Serial.println("  d_back      - DFR0994 M1..M4 low-PWM backward 0.5s");
   Serial.println("  d_pwm N     - both tracks PWM -255..255");
-  Serial.println("  d_left N    - onboard M1 / left pair PWM -255..255");
-  Serial.println("  d_right N   - onboard M2 / right pair PWM -255..255");
+  Serial.println("  d_left N    - DFR0994 M1/M2 left track PWM -255..255");
+  Serial.println("  d_right N   - DFR0994 M3/M4 right track PWM -255..255");
   Serial.println("  d_drive L R - left/right PWM -255..255");
-  Serial.println("  d_m1_raw    - left pair timed low-PWM forward test 300ms");
-  Serial.println("  d_m2_raw    - right pair timed low-PWM forward test 300ms");
+  Serial.println("  d_m1_raw    - M1 left-front timed low-PWM test 300ms");
+  Serial.println("  d_m2_raw    - M2 left-rear timed low-PWM test 300ms");
+  Serial.println("  d_m3_raw    - M3 right-front timed low-PWM test 300ms");
+  Serial.println("  d_m4_raw    - M4 right-rear timed low-PWM test 300ms");
   Serial.println("  d_ticks     - print placeholder ticks (encoders not connected)");
   Serial.println("  d_zero      - clear placeholder ticks");
   Serial.println("  d_stop      - onboard chassis stop");
@@ -6159,16 +6381,16 @@ void printHelp() {
   Serial.println("  hx_torque_off_all      - EMERGENCY/DEBUG only; loaded HX joints may drop");
   Serial.println("  cal_list / cal_select ID / cal_read / cal_jog DELTA");
   Serial.println("  cal_set_min / cal_set_center / cal_set_max / cal_invert 0|1 / cal_save");
-  Serial.println("  restore_torso_calibration - restore verified ID11 NVS values; no motion");
-  Serial.println("  pose_capture torso_fold|torso_unfold - capture approved torso pose to NVS");
-  Serial.println("  pose_check              - read-only check of the two torso poses");
+  Serial.println("  Legacy HTD torso poses are not used; both folding boards use per-axis step travel");
   Serial.println("  fold_status / zero / jog +/-100|+/-500 / save / reset_travel (quarter-step; max travel=16000)");
-  Serial.println("  stepper_test unfold|fold 6|10|20|30 - calibrated A4988 only, no ID11 move; begin with 20 seconds");
+  Serial.println("  axis1|axis2 zero / confirm_unfolded / jog +/-200 / save / reset_travel / fold_direction / fold_status");
+  Serial.println("  Explicit axis USB setup requires Web motion OFF; ordinary zero/jog/save remain axis1 only");
+  Serial.println("  stepper_test unfold|fold 6|10|20|30 - axis1 only; begin with 20 seconds");
   Serial.println("  step_diag / d_status - read-only GPIO and PWM diagnostics");
   Serial.println("  step_level_test - USB-only meter-test instructions/status; BOTH drivers removed and ALL motor power unplugged first");
   Serial.println("  step_level_test drivers_removed_power_off - fixed 30s STEP LOW/HIGH test; motion locked until reboot");
   Serial.println("  step_level_test stop - stop test immediately; keeps reboot-required lock");
-  Serial.println("  fold_direction / rescan - stepper calibration and ID11 diagnostics");
+  Serial.println("  fold_direction / rescan - axis1 direction / dual pulse-engine diagnostics");
   Serial.println("  restore_stepper_15200 - USB only; unchanged quarter-step hardware confirmed; Web motion OFF; restore 15200/inverted, no motion, ZERO still required");
   Serial.println("  torso_unfold/torso_fold (aliases: unfold/fold) - synchronized folding actions");
   Serial.println("  HX-30HM arm IDs 1..6 are controlled from the web press/hold buttons");
@@ -6179,8 +6401,7 @@ void printHelp() {
   Serial.println("  {\"seq\":3,\"cmd\":\"heartbeat\"}");
   Serial.println("  {\"seq\":4,\"cmd\":\"stop\"}");
   Serial.println("  {\"seq\":5,\"cmd\":\"drive\",\"left_pwm\":60,\"right_pwm\":60}");
-  Serial.println("  {\"seq\":6,\"cmd\":\"htd\",\"htd_delta\":10,\"time_ms\":800}");
-  Serial.println("  {\"seq\":7,\"cmd\":\"motion\",\"htd_delta\":10,\"left_pwm\":50,\"right_pwm\":50}");
+  Serial.println("  ROS/WebSocket: stepper_* commands accept integer axis:1 or axis:2 (omitted=1)");
   Serial.println();
 }
 
@@ -6218,7 +6439,11 @@ void handleCommand(String command) {
     return;
   }
 
-  if (handleId11SetupCommand(command)) return;
+  if (command.startsWith("h_") || command == "restore_torso_calibration") {
+    Serial.println("ERR id11_replaced_by_stepper_axis2");
+    return;
+  }
+  if (handleFoldAxisCommand(command)) return;
 
   if (handleStepperOnlyTestCommand(command)) {
     return;
@@ -6230,17 +6455,20 @@ void handleCommand(String command) {
     printFoldStatus();
   } else if (command == "step_diag") {
     foldStepper.printDiagnostics();
+    foldStepper2.printDiagnostics();
   } else if (command == "d_status") {
-    Serial.println("DRIVE mode=drive_brake pwm_hz=20000 zero=coast (duty registers are not measured speed)");
+    Serial.println("DRIVE board=DFR0994 mode=PH_EN pwm_hz=20000 EN_zero=brake (duty is not measured speed)");
     Serial.printf("DRIVE ready=%s fault=%s left=%d right=%d\n",
                   drivePwmReady ? "yes" : "no", drivePwmFault ? "yes" : "no",
                   driveLeftPwm, driveRightPwm);
-    const int pins[] = {PIN_ONBOARD_M1_IN1, PIN_ONBOARD_M1_IN2,
-                        PIN_ONBOARD_M2_IN1, PIN_ONBOARD_M2_IN2};
-    for (int pin : pins) {
-      Serial.printf("GPIO%d duty_register=%lu frequency_when_active=%lu\n", pin,
-                    static_cast<unsigned long>(ledcRead(pin)),
-                    static_cast<unsigned long>(ledcReadFreq(pin)));
+    const int enablePins[] = {PIN_M1_EN, PIN_M2_EN, PIN_M3_EN, PIN_M4_EN};
+    const int phasePins[] = {PIN_M1_PH, PIN_M2_PH, PIN_M3_PH, PIN_M4_PH};
+    for (size_t index = 0; index < 4; ++index) {
+      Serial.printf("M%u EN=GPIO%d duty=%lu freq_when_active=%lu PH=GPIO%d level=%d\n",
+                    static_cast<unsigned>(index + 1), enablePins[index],
+                    static_cast<unsigned long>(ledcRead(enablePins[index])),
+                    static_cast<unsigned long>(ledcReadFreq(enablePins[index])),
+                    phasePins[index], digitalRead(phasePins[index]));
     }
   } else if (command == "zero") {
     String reason;
@@ -6265,7 +6493,8 @@ void handleCommand(String command) {
     Serial.println(foldToggleDirection(reason) ? ("OK " + reason) : ("ERR " + reason));
   } else if (command == "rescan") {
     String reason;
-    Serial.println(foldRescan(reason) ? "OK id11_online" : ("ERR " + reason));
+    const bool ok = foldRescan(reason);
+    Serial.println((ok ? String("OK ") : String("ERR ")) + reason);
   } else if (command == "unfold" || command == "fold") {
     String reason;
     const String action = command == "unfold" ? "torso_unfold" : "torso_fold";
@@ -6330,6 +6559,10 @@ void handleCommand(String command) {
     onboardM1RawTest();
   } else if (command == "d_m2_raw") {
     onboardM2RawTest();
+  } else if (command == "d_m3_raw") {
+    onboardM3RawTest();
+  } else if (command == "d_m4_raw") {
+    onboardM4RawTest();
   } else if (command == "d_ticks") {
     drivePrintTicks();
   } else if (command == "d_zero") {
@@ -6433,33 +6666,34 @@ void setup() {
   delay(1200);
 
   Serial.println();
-  Serial.println("Sophicar ESP32-S3-N16R8 + onboard DRV8870 staged controller");
+  Serial.println("DFR0994 Romeo ESP32-S3 staged controller");
   Serial.println(FIRMWARE_BUILD_ID);
   foldStepper.printDiagnostics();
+  foldStepper2.printDiagnostics();
   Serial.print("HTD UART pins TX/RX = ");
   Serial.print(PIN_HTD_TX);
   Serial.print("/");
   Serial.println(PIN_HTD_RX);
-  Serial.println("Shared HTD/HX BusLinker uses the HTD UART pins above at 115200");
+  Serial.println("HX IDs1..6 BusLinker uses UART pins above at 115200; retired ID11 is not commanded");
   Serial.printf("A4988 external pins DIR=%u STEP=%u ENABLE=%d active_low=yes\n",
                 PIN_FOLD_DIR, PIN_FOLD_STEP, PIN_FOLD_ENABLE);
+  Serial.printf("A4988 axis2 pins DIR=%u STEP=%u ENABLE=%d active_low=yes\n",
+                PIN_FOLD2_DIR, PIN_FOLD2_STEP, PIN_FOLD2_ENABLE);
   Serial.printf("A4988 single-output GPTimer=%s resolution=1MHz step_high_us=4 rising_only=yes fixed_microstep=1/4 MS1=GND MS2=3V3 MS3=GND\n",
                 foldStepper.pulseEngineReady() ? "ready" : "fault");
-  Serial.printf("Onboard DRV8870 M1 IN1/IN2 = %d/%d (left motor pair)\n",
-                PIN_ONBOARD_M1_IN1, PIN_ONBOARD_M1_IN2);
-  Serial.printf("Onboard DRV8870 M2 IN1/IN2 = %d/%d (right motor pair)\n",
-                PIN_ONBOARD_M2_IN1, PIN_ONBOARD_M2_IN2);
-  Serial.println("Build requirement: PSRAM Disabled; chassis encoders are not connected");
+  Serial.printf("DFR0994 PH/EN M1=%d/%d M2=%d/%d M3=%d/%d M4=%d/%d; PMODE jumper must be shorted\n",
+                PIN_M1_EN, PIN_M1_PH, PIN_M2_EN, PIN_M2_PH,
+                PIN_M3_EN, PIN_M3_PH, PIN_M4_EN, PIN_M4_PH);
+  Serial.println("Build requirement: 16MB Flash + OPI PSRAM; chassis encoders are not connected");
   beginHtd(HTD_DEFAULT_BAUD);
   beginArmBus();
   loadCalibration();
-  foldId11Online = servoPing(TORSO_SECOND_BOARD_ID);
 
   beginWebControl();
   printHelp();
 
   Serial.println("Boot complete. A4988 STEP is LOW and ENABLE is HIGH (disabled); external pull-up still required.");
-  Serial.println("Place the first folding joint at the folded mechanical endpoint, then run ZERO.");
+  Serial.println("Confirm each physical endpoint separately: axis1 zero / axis2 zero. No automatic homing or motion.");
 }
 
 void serviceSerialInput() {
